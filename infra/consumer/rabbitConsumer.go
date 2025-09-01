@@ -6,10 +6,12 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	eventcounter "github.com/reb-felipe/eventcounter/pkg"
+	service "github.com/reb-felipe/eventcounter/infra/service"
 )
 
 const (
@@ -21,13 +23,13 @@ type Message struct {
 	ID string `json:"id"`
 }
 
-type RabbitConn struct {
-	conn 	*amqp.Connection
-	channel *amqp.Channel
-	event 	eventcounter.Consumer
+type RabbitConsumer struct {
+	Conn 	*amqp.Connection
+	Channel *amqp.Channel
+	Event 	eventcounter.Consumer
 }
 
-func ConnectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, error) {
+func ConnectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConsumer, error) {
 	conn, err := amqp.Dial(rabbitURL)
 	if err != nil {
 		return nil, err
@@ -39,19 +41,19 @@ func ConnectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, 
 		return nil, err
 	}
 
-	return &RabbitConn{
+	return &RabbitConsumer{
 		conn, 
 		ch, 
 		event,
 	}, nil
 }
 
-func (c *RabbitConn) ConsumeMessages(ctx context.Context) error {
-	msgs, err := c.channel.Consume(
+func (c *RabbitConsumer) ConsumeMessages(ctx context.Context, shutdownService *service.ShutdownService) error {
+	msgs, err := c.Channel.Consume(
 		queueName,
 		consumerTag,
-		true,  
-		false, 
+		true,
+		false,
 		false,
 		false,
 		nil,
@@ -60,75 +62,131 @@ func (c *RabbitConn) ConsumeMessages(ctx context.Context) error {
 		return err
 	}
 
-	processed := make(map[string]bool) 
+	processed := make(map[string]bool)
 
+	// Canais por tipo de evento
+	createdCh := make(chan string)
+	updatedCh := make(chan string)
+	deletedCh := make(chan string)
+
+	var wg sync.WaitGroup
+
+	// Goroutines consumidoras
+	wg.Add(3)
+	go c.consumeChannel(ctx, &wg, createdCh, c.Event.Created)
+	go c.consumeChannel(ctx, &wg, updatedCh, c.Event.Updated)
+	go c.consumeChannel(ctx, &wg, deletedCh, c.Event.Deleted)
+
+	inactivity := time.NewTimer(shutdownService.Timeout)
+    defer inactivity.Stop()
+
+	// Loop principal de consumo
 	for {
 		select {
 		case <-ctx.Done():
+			close(createdCh)
+			close(updatedCh)
+			close(deletedCh)
+			wg.Wait()
 			return nil
 		case d, ok := <-msgs:
 			if !ok {
+				close(createdCh)
+				close(updatedCh)
+				close(deletedCh)
+				wg.Wait()
 				return nil
 			}
-			c.ProcessMessage(ctx, d, processed)
-		case <-time.After(5 * time.Second):
-			log.Println("Nenhuma mensagem recebida em 5 segundos, finalizando.")
-			return nil
+
+			// Reset do timer porque chegou mensagem
+            if !inactivity.Stop() {
+                <-inactivity.C
+            }
+            inactivity.Reset(shutdownService.Timeout)
+
+            c.ProcessMessage(d, processed, createdCh, updatedCh, deletedCh, shutdownService)
+
+        case <-inactivity.C:
+            log.Println("Timeout de inatividade atingido. Encerrando consumer...")
+            close(createdCh)
+            close(updatedCh)
+            close(deletedCh)
+            wg.Wait()
+            return nil
 		}
-		
 	}
 }
 
-func (c *RabbitConn) ProcessMessage(ctx context.Context, d amqp.Delivery, processed map[string]bool) {
+func (c *RabbitConsumer) ProcessMessage(
+	d amqp.Delivery,
+	processed map[string]bool,
+	createdCh, updatedCh, deletedCh chan string,
+	shutdownService *service.ShutdownService,
+) {
 	var m Message
 	if err := json.Unmarshal(d.Body, &m); err != nil {
 		log.Printf("Erro ao decodificar mensagem: %v", err)
 		return
 	}
 
-	// Verifica duplicado
 	if processed[m.ID] {
 		return
 	}
 	processed[m.ID] = true
 
-	// Extrai userID e eventType da routing key
 	parts := strings.Split(d.RoutingKey, ".")
 	if len(parts) != 3 {
 		log.Printf("Routing key inválida: %s", d.RoutingKey)
 		return
 	}
+
 	userID := parts[0]
 	eventType := parts[2]
 
-	log.Printf("Mensagem processada: userID=%s, eventType=%s", userID, eventType)
-
-	msgCtx := context.WithValue(ctx, "messageID", m.ID)
-
-	var err error
-	switch eventcounter.EventType(eventType) {
-	case eventcounter.EventCreated:
-		err = c.event.Created(msgCtx, userID)
-	case eventcounter.EventUpdated:
-		err = c.event.Updated(msgCtx, userID)
-	case eventcounter.EventDeleted:
-		err = c.event.Deleted(msgCtx, userID)
+	// Envia para canal correto
+	switch eventType {
+	case "created":
+		createdCh <- userID
+	case "updated":
+		updatedCh <- userID
+	case "deleted":
+		deletedCh <- userID
 	default:
 		log.Printf("Tipo de evento desconhecido: %s", eventType)
 		return
 	}
 
-	if err != nil {
-		log.Printf("Mensagem para usuário '%s' não processada: %v", userID, err)
+	log.Printf("Mensagem enviada para canal: userID=%s, eventType=%s", userID, eventType)
+
+	if shutdownService != nil {
+		shutdownService.UpdateLastMessage()
 	}
 }
 
-func (c *RabbitConn) Close() {
-	if c.channel != nil {
-		c.channel.Close()
+func (c *RabbitConsumer) consumeChannel(ctx context.Context, wg *sync.WaitGroup, ch <-chan string, handler func(context.Context, string) error) {
+	defer wg.Done()
+	for userID := range ch {
+		//handler(ctx, userID)
+
+		log.Printf(">> Worker %p começou a processar %s", ch, userID)
+
+        // simula processamento pesado
+        time.Sleep(2 * time.Second)
+
+        if err := handler(ctx, userID); err != nil {
+            log.Printf("Erro ao processar %s: %v", userID, err)
+        }
+
+        log.Printf(">> Worker %p terminou de processar %s", ch, userID)
 	}
-	if c.conn != nil {
-		c.conn.Close()
+}
+
+func (rc *RabbitConsumer) Close() {
+	if rc.Channel != nil {
+		rc.Channel.Close()
+	}
+	if rc.Conn != nil {
+		rc.Conn.Close()
 	}
 	log.Println("Conexão com RabbitMQ fechada.")
 }
