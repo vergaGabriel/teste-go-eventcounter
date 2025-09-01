@@ -7,73 +7,65 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	eventcounter "github.com/reb-felipe/eventcounter/pkg"
 )
 
 type ShutdownService struct {
 	Timeout time.Duration
+	lastMessage time.Time
+	mu sync.Mutex
 }
 
-// Inicia monitoramento de canais e dispara shutdown após timeout
-func (s *ShutdownService) MonitorAndShutdown(ctx context.Context, cancelFunc context.CancelFunc,
-	counter *CounterService, wg *sync.WaitGroup,
-	createdCh, updatedCh, deletedCh <-chan string) {
+// Atualiza o horário da última mensagem recebida
+func (s *ShutdownService) UpdateLastMessage() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastMessage = time.Now()
+}
 
-	idleTimer := time.NewTimer(s.Timeout)
+// Inicia monitoramento de inatividade e dispara shutdown após timeout
+func (s *ShutdownService) MonitorAndShutdown(ctx context.Context, cancelFunc context.CancelFunc, counter *CounterService) {
+	s.UpdateLastMessage() // inicializa o timer
 
-	resetTimer := func() {
-		if !idleTimer.Stop() {
-			<-idleTimer.C
-		}
-		idleTimer.Reset(s.Timeout)
-	}
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
-	// Goroutine que monitora canais para resetar timer
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case _, ok := <-createdCh:
-				if ok {
-					resetTimer()
-				}
-			case _, ok := <-updatedCh:
-				if ok {
-					resetTimer()
-				}
-			case _, ok := <-deletedCh:
-				if ok {
-					resetTimer()
+			case <-ticker.C:
+				s.mu.Lock()
+				elapsed := time.Since(s.lastMessage)
+				s.mu.Unlock()
+				if elapsed >= s.Timeout {
+					log.Println("Timeout atingido. Iniciando shutdown...")
+					cancelFunc()
+					s.ExportJSON(counter)
+					return
 				}
 			}
 		}
 	}()
-
-	// Goroutine que aguarda timeout para encerrar
-	go func() {
-		select {
-		case <-idleTimer.C:
-			log.Println("Timeout atingido. Iniciando shutdown...")
-
-			// Cancela contexto principal
-			cancelFunc()
-
-			// Espera goroutines terminarem
-			wg.Wait()
-
-			// Escreve JSONs
-			s.ExportJSON(counter)
-		case <-ctx.Done():
-			return
-		}
-	}()
 }
 
-// Exporta contadores para arquivos JSON por tipo de evento
+// Exporta contadores para arquivos JSON com nomes baseados nos tipos de evento
 func (s *ShutdownService) ExportJSON(counter *CounterService) {
 	data := counter.GetData()
-	for eventType, users := range data {
-		filename := eventType + ".json"
+	eventTypes := []eventcounter.EventType{
+		eventcounter.EventCreated,
+		eventcounter.EventUpdated,
+		eventcounter.EventDeleted,
+	}
+
+	for _, eventType := range eventTypes {
+		users, ok := data[string(eventType)]
+		if !ok {
+			continue
+		}
+		filename := string(eventType) + ".json"
 		file, err := os.Create(filename)
 		if err != nil {
 			log.Printf("Erro ao criar arquivo %s: %v", filename, err)

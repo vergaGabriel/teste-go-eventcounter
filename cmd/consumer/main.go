@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	rabbit "https://github.com/vergaGabriel/teste-go-eventcounter/tree/main/infra/consumer"
-	service "https://github.com/vergaGabriel/teste-go-eventcounter/tree/main/infra/service"
+	rabbit "github.com/reb-felipe/eventcounter/infra/consumer"
+	service "github.com/reb-felipe/eventcounter/infra/service"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 
 	// Inicializa o consumer do RabbitMQ, passando o CounterService como Consumer
 	rabbitURL := "amqp://guest:guest@localhost:5672/" // ou variável de ambiente
-	consumer, err := rabbit.NewRabbitConsumer(rabbitURL, counterService)
+	consumer, err := rabbit.ConnectRabbit(rabbitURL, counterService)
 	if err != nil {
 		log.Fatalf("Erro ao conectar RabbitMQ: %v", err)
 	}

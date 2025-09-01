@@ -6,6 +6,7 @@ import (
 	"context"
 	"log"
 	"strings"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	eventcounter "github.com/reb-felipe/eventcounter/pkg"
@@ -26,7 +27,7 @@ type RabbitConn struct {
 	event 	eventcounter.Consumer
 }
 
-func connectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, error) {
+func ConnectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, error) {
 	conn, err := amqp.Dial(rabbitURL)
 	if err != nil {
 		return nil, err
@@ -41,7 +42,7 @@ func connectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, 
 	return &RabbitConn{
 		conn, 
 		ch, 
-		event
+		event,
 	}, nil
 }
 
@@ -69,8 +70,12 @@ func (c *RabbitConn) ConsumeMessages(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			ProcessMessage(ctx, d, processed)
+			c.ProcessMessage(ctx, d, processed)
+		case <-time.After(5 * time.Second):
+			log.Println("Nenhuma mensagem recebida em 5 segundos, finalizando.")
+			return nil
 		}
+		
 	}
 }
 
@@ -95,6 +100,8 @@ func (c *RabbitConn) ProcessMessage(ctx context.Context, d amqp.Delivery, proces
 	}
 	userID := parts[0]
 	eventType := parts[2]
+
+	log.Printf("Mensagem processada: userID=%s, eventType=%s", userID, eventType)
 
 	msgCtx := context.WithValue(ctx, "messageID", m.ID)
 

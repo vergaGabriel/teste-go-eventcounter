@@ -1,45 +1,63 @@
 package service
 
 import (
+	"context"
 	"sync"
+
+	eventcounter "github.com/reb-felipe/eventcounter/pkg"
 )
 
-// CounterService gerencia a contagem por tipo de evento e usuário
 type CounterService struct {
-	mu   sync.Mutex
-	data map[string]map[string]int // data[eventType][userID] = contador
+	mu    sync.Mutex
+	count map[string]map[string]int // eventType -> userID -> count
 }
 
-// Novo serviço de contador
 func NewCounterService() *CounterService {
 	return &CounterService{
-		data: make(map[string]map[string]int),
+		count: make(map[string]map[string]int),
 	}
 }
 
-// Incrementa o contador para um usuário e tipo de evento
-func (s *CounterService) Increment(eventType, userID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Incrementa contador interno
+func (c *CounterService) Increment(eventType eventcounter.EventType, userID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if _, ok := s.data[eventType]; !ok {
-		s.data[eventType] = make(map[string]int)
+	if _, ok := c.count[string(eventType)]; !ok {
+		c.count[string(eventType)] = make(map[string]int)
 	}
-	s.data[eventType][userID]++
+
+	c.count[string(eventType)][userID]++
 }
 
-// Retorna os dados atuais do contador
-func (s *CounterService) GetData() map[string]map[string]int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Implementa a interface eventcounter.Consumer
+func (c *CounterService) Created(_ context.Context, userID string) error {
+	c.Increment(eventcounter.EventCreated, userID)
+	return nil
+}
 
-	// Retorna uma cópia para evitar race conditions
-	copyData := make(map[string]map[string]int)
-	for eventType, users := range s.data {
-		copyData[eventType] = make(map[string]int)
+func (c *CounterService) Updated(_ context.Context, userID string) error {
+	c.Increment(eventcounter.EventUpdated, userID)
+	return nil
+}
+
+func (c *CounterService) Deleted(_ context.Context, userID string) error {
+	c.Increment(eventcounter.EventDeleted, userID)
+	return nil
+}
+
+// Retorna os dados para exportação
+func (c *CounterService) GetData() map[string]map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Retorna uma cópia
+	copy := make(map[string]map[string]int)
+	for eventType, users := range c.count {
+		copy[eventType] = make(map[string]int)
 		for user, count := range users {
-			copyData[eventType][user] = count
+			copy[eventType][user] = count
 		}
 	}
-	return copyData
+	return copy
 }
