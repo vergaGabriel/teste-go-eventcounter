@@ -1,86 +1,127 @@
-package main
+package consumer
 
 
 import (
 	"encoding/json"
-	"fmt"
+	"context"
 	"log"
-	"os"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	eventcounter "github.com/reb-felipe/eventcounter/pkg"
 )
 
-// Estrutura da mensagem
+const (
+	queueName   = "eventcountertest"
+	consumerTag = "eventcountertest-consumer"
+)
+
 type Message struct {
 	ID string `json:"id"`
 }
 
-func failOnError(err error, msg string) {
+type RabbitConn struct {
+	conn 	*amqp.Connection
+	channel *amqp.Channel
+	event 	eventcounter.Consumer
+}
+
+func connectRabbit(rabbitURL string, event eventcounter.Consumer) (*RabbitConn, error) {
+	conn, err := amqp.Dial(rabbitURL)
 	if err != nil {
-		log.Fatalf("%s: %s", msg, err)
+		return nil, err
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return &RabbitConn{
+		conn, 
+		ch, 
+		event
+	}, nil
+}
+
+func (c *RabbitConn) ConsumeMessages(ctx context.Context) error {
+	msgs, err := c.channel.Consume(
+		queueName,
+		consumerTag,
+		true,  
+		false, 
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	processed := make(map[string]bool) 
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case d, ok := <-msgs:
+			if !ok {
+				return nil
+			}
+			ProcessMessage(ctx, d, processed)
+		}
 	}
 }
 
-func main() {
-	// Pega a URL do Rabbit via env (ou usa padrão)
-	rabbitURL := os.Getenv("RABBIT_URL")
-	if rabbitURL == "" {
-		rabbitURL = "amqp://guest:guest@localhost:5672/"
+func (c *RabbitConn) ProcessMessage(ctx context.Context, d amqp.Delivery, processed map[string]bool) {
+	var m Message
+	if err := json.Unmarshal(d.Body, &m); err != nil {
+		log.Printf("Erro ao decodificar mensagem: %v", err)
+		return
 	}
 
-	// Conexão
-	conn, err := amqp.Dial(rabbitURL)
-	failOnError(err, "Falha ao conectar no RabbitMQ")
-	defer conn.Close()
+	// Verifica duplicado
+	if processed[m.ID] {
+		return
+	}
+	processed[m.ID] = true
 
-	// Canal
-	ch, err := conn.Channel()
-	failOnError(err, "Falha ao abrir canal")
-	defer ch.Close()
+	// Extrai userID e eventType da routing key
+	parts := strings.Split(d.RoutingKey, ".")
+	if len(parts) != 3 {
+		log.Printf("Routing key inválida: %s", d.RoutingKey)
+		return
+	}
+	userID := parts[0]
+	eventType := parts[2]
 
-	// Declara a fila (precisa existir)
-	q, err := ch.QueueDeclare(
-		"eventcountertest", // nome
-		true,               // durável
-		false,              // auto-delete
-		false,              // exclusiva
-		false,              // no-wait
-		nil,                // argumentos
-	)
-	failOnError(err, "Falha ao declarar fila")
+	msgCtx := context.WithValue(ctx, "messageID", m.ID)
 
-	// Consome mensagens
-	msgs, err := ch.Consume(
-		q.Name, // fila
-		"",     // consumer
-		true,   // auto-ack (pode mudar para false se quiser confirmar manualmente)
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Falha ao registrar consumidor")
+	var err error
+	switch eventcounter.EventType(eventType) {
+	case eventcounter.EventCreated:
+		err = c.event.Created(msgCtx, userID)
+	case eventcounter.EventUpdated:
+		err = c.event.Updated(msgCtx, userID)
+	case eventcounter.EventDeleted:
+		err = c.event.Deleted(msgCtx, userID)
+	default:
+		log.Printf("Tipo de evento desconhecido: %s", eventType)
+		return
+	}
 
-	fmt.Println(" [*] Esperando mensagens... CTRL+C para sair")
+	if err != nil {
+		log.Printf("Mensagem para usuário '%s' não processada: %v", userID, err)
+	}
+}
 
-	// Loop de mensagens
-	forever := make(chan bool)
-
-	go func() {
-		for d := range msgs {
-			// Routing key (contém userID e tipo do evento)
-			routingKey := d.RoutingKey
-
-			// Decodifica o corpo JSON
-			var m Message
-			if err := json.Unmarshal(d.Body, &m); err != nil {
-				log.Printf("Erro ao decodificar mensagem: %v", err)
-				continue
-			}
-
-			fmt.Printf("Mensagem recebida | ID: %s | RoutingKey: %s\n", m.ID, routingKey)
-		}
-	}()
-
-	<-forever
+func (c *RabbitConn) Close() {
+	if c.channel != nil {
+		c.channel.Close()
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	log.Println("Conexão com RabbitMQ fechada.")
 }
