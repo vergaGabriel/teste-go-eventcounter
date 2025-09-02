@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"fmt"
 
 	eventcounter "github.com/reb-felipe/eventcounter/pkg"
 )
@@ -60,12 +61,15 @@ func (s *ShutdownService) ExportJSON(counter *CounterService) {
 		eventcounter.EventDeleted,
 	}
 
+	outputDir := "./output"
+
 	for _, eventType := range eventTypes {
 		users, ok := data[string(eventType)]
 		if !ok {
 			continue
 		}
-		filename := string(eventType) + ".json"
+		//filename := string(eventType) + ".json"
+		filename := fmt.Sprintf("%s/%s.json", outputDir, eventType)
 		file, err := os.Create(filename)
 		if err != nil {
 			log.Printf("Erro ao criar arquivo %s: %v", filename, err)
